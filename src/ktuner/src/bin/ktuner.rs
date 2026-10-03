@@ -156,7 +156,12 @@ fn cmd_tune(dry_run: bool, conservative: bool, cat: Option<String>) -> Result<i3
     if conservative {
         recs.retain(|r| r.confidence == rules::Confidence::High);
     }
-    recs.retain(|r| r.writable && !category::is_runtime_dangerous(&r.param));
+
+    // A finding `tune` can actually write on this host: /proc/sys must accept
+    // writes here (it is read-only in some containers) and the parameter must be
+    // safe to change at runtime.
+    let can_apply =
+        |rec: &Recommendation| rec.writable && !category::is_runtime_dangerous(&rec.param);
 
     if recs.is_empty() {
         let output = json!({ "status": "optimal", "applied": 0 });
@@ -165,8 +170,27 @@ fn cmd_tune(dry_run: bool, conservative: bool, cat: Option<String>) -> Result<i3
     }
 
     if dry_run {
+        // A dry run writes nothing and needs no root, so the applicability guard
+        // must not decide what it previews: `would_apply` is the engine's plan
+        // and `skipped` says how many of those entries a real run would leave
+        // out. Filtering first made the preview print
+        // `{"status": "optimal"}` for a host `check` had just listed findings
+        // for, whenever the caller cannot write /proc/sys (non-root, or a
+        // container with read-only sysctl).
+        let skipped = recs.iter().filter(|rec| !can_apply(rec)).count();
         let recs_json: Vec<serde_json::Value> = recs.iter().map(rec_json).collect();
-        let output = json!({ "dry_run": true, "would_apply": recs_json });
+        let output = json!({ "dry_run": true, "would_apply": recs_json, "skipped": skipped });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+        return Ok(0);
+    }
+
+    let found = recs.len();
+    recs.retain(can_apply);
+    if recs.is_empty() {
+        // The engine did find these findings; this host just cannot take them
+        // (needs root, read-only /proc/sys, or a knob held back as
+        // runtime-dangerous). Reporting "optimal" here claimed a tuned host.
+        let output = json!({ "status": "skipped", "applied": 0, "skipped": found });
         println!("{}", serde_json::to_string_pretty(&output)?);
         return Ok(0);
     }
