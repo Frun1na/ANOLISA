@@ -607,6 +607,20 @@ mod tests {
         assert_eq!(usage.output_tokens, 3);
     }
 
+    /// The same captured payload parsed as a complete buffer must agree with the
+    /// truncated path (`test_scan_partial_usage_truncated_buffer`): the
+    /// Responses usage shape is OpenAI, not Anthropic.
+    #[test]
+    fn test_response_completed_provider_is_openai() {
+        let data = r#"{"sequence_number":10,"type":"response.completed","response":{"top_logprobs":0,"instructions":"You are a helpful assistant.","metadata":{},"usage":{"total_tokens":60,"input_tokens_details":{"cached_tokens":0},"output_tokens":3,"input_tokens":57,"output_tokens_details":{"reasoning_tokens":0},"x_details":[{"total_tokens":60,"x_billing_type":"response_api","output_tokens":3,"input_tokens":57,"prompt_tokens_details":{"cached_tokens":0}}]},"created_at":1782287513,"model":"qwen3-coder-plus"}}"#;
+        let usage = TokenParser::new()
+            .parse_data(data)
+            .expect("usage should parse");
+        assert_eq!(usage.provider, LLMProvider::OpenAI);
+        assert_eq!(usage.input_tokens, 57);
+        assert_eq!(usage.output_tokens, 3);
+    }
+
     #[test]
     fn test_scan_partial_usage_truncated_buffer() {
         // Simulate a continuation buffer where only the leading bytes around

@@ -132,9 +132,16 @@ pub fn extract_usage_object(
 ) -> Option<TokenUsage> {
     let (input_tokens, output_tokens) = match provider {
         LLMProvider::OpenAI => {
-            let input = usage.get("prompt_tokens").and_then(|v| v.as_u64())?;
+            // Chat completions reports prompt_tokens/completion_tokens; the
+            // Responses API uses input_tokens/output_tokens, the same names the
+            // truncated-buffer reader accepts (`scan_partial_usage`).
+            let input = usage
+                .get("prompt_tokens")
+                .or_else(|| usage.get("input_tokens"))
+                .and_then(|v| v.as_u64())?;
             let output = usage
                 .get("completion_tokens")
+                .or_else(|| usage.get("output_tokens"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
             (input, output)
@@ -304,6 +311,24 @@ pub fn detect_provider_from_usage(usage: &serde_json::Value) -> LLMProvider {
         return LLMProvider::DashScope;
     }
 
+    // The OpenAI Responses API (and DashScope compatible-mode /responses)
+    // reports input_tokens/output_tokens with the `*_tokens_details` siblings,
+    // which no other shape emits; the /v1/responses path rule and the
+    // truncated-buffer reader already label it OpenAI (90d2b832f). This must
+    // precede the Anthropic branch below, which otherwise claims every
+    // Responses record.
+    let responses_details = usage
+        .get("input_tokens_details")
+        .and_then(|details| details.get("cached_tokens"))
+        .is_some()
+        || usage
+            .get("output_tokens_details")
+            .and_then(|details| details.get("reasoning_tokens"))
+            .is_some();
+    if responses_details {
+        return LLMProvider::OpenAI;
+    }
+
     // Anthropic uses input_tokens/output_tokens
     if usage.get("input_tokens").is_some() && usage.get("output_tokens").is_some() {
         return LLMProvider::Anthropic;
@@ -374,6 +399,27 @@ mod tests {
             "total_tokens": 30
         });
         assert_eq!(detect_provider_from_usage(&usage), LLMProvider::Anthropic);
+    }
+
+    /// The Responses API reports input_tokens/output_tokens with the
+    /// `*_tokens_details` siblings. Both the path rule (/v1/responses => openai)
+    /// and the truncated-buffer reader label that shape OpenAI, so the
+    /// usage-shape detector must not fall through to the Anthropic branch and
+    /// book every codex/GPT-5 Responses call as anthropic.
+    #[test]
+    fn test_detect_provider_from_usage_responses_details_is_openai() {
+        let usage = serde_json::json!({
+            "total_tokens": 60,
+            "input_tokens": 57,
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens": 3,
+            "output_tokens_details": {"reasoning_tokens": 0}
+        });
+        assert_eq!(
+            detect_provider_from_usage(&usage),
+            LLMProvider::OpenAI,
+            "Responses usage must not fall through to the Anthropic branch"
+        );
     }
 
     /// Modality counters *are* DashScope-only — no Anthropic or OpenAI usage
