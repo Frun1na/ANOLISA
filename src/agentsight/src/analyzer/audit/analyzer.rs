@@ -50,8 +50,16 @@ impl AuditAnalyzer {
         // Create llm_call audit records for SSE responses AND non-streaming
         // LLM API calls (identified by path). Without this, non-streaming
         // completions (stream:false) are invisible in audit --type llm.
+        //
+        // Anthropic's /v1/messages/count_tokens and /v1/messages/batches* are
+        // not inference calls and must stay in lockstep with the same
+        // exclusions in `genai::is_llm_api_path` and
+        // `AnthropicParser::matches_path`: the counting request replays the
+        // conversation, so recording it adds zero-token rows.
         let is_llm_path = http_record.path.contains("/chat/completions")
-            || http_record.path.contains("/v1/messages")
+            || (http_record.path.contains("/v1/messages")
+                && !http_record.path.contains("/v1/messages/count_tokens")
+                && !http_record.path.contains("/v1/messages/batches"))
             || http_record.path.contains("/v1/completions")
             || http_record
                 .path
@@ -294,6 +302,38 @@ mod tests {
         assert!(
             result.is_none(),
             "non-LLM path must NOT produce audit record"
+        );
+    }
+
+    /// `/v1/messages/count_tokens` and the Batch API's `/v1/messages/batches*`
+    /// share the inference prefix but are not inference calls: the counting
+    /// request carries the conversation the real call will send, so recording
+    /// it adds zero-token LlmCall rows and doubles per-conversation counts.
+    /// The path gates in `genai` and `anthropic` already exclude them.
+    #[test]
+    fn test_nonsse_count_tokens_and_batches_paths_no_audit() {
+        let analyzer = AuditAnalyzer::new();
+        for path in [
+            "/v1/messages/count_tokens",
+            "/v1/messages/batches",
+            "/v1/messages/batches/msgbatch_1/results",
+        ] {
+            let record = make_http_record(path, false, None);
+            assert!(
+                analyzer.analyze_http(&record, None).is_none(),
+                "{path} is not an LLM inference call"
+            );
+        }
+    }
+
+    /// Guard: the inference path itself keeps producing its record.
+    #[test]
+    fn test_nonsse_messages_path_still_produces_audit() {
+        let analyzer = AuditAnalyzer::new();
+        let record = make_http_record("/v1/messages", false, None);
+        assert!(
+            analyzer.analyze_http(&record, None).is_some(),
+            "/v1/messages is an inference call"
         );
     }
 
