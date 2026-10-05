@@ -139,6 +139,7 @@ impl SkillFs {
                     self.send_sync(SyncEvent::Reparse {
                         skill_name: skill_name.clone(),
                         source_path: self.skill_physical_dir(skill_name).join("SKILL.md"),
+                        max_skill_size: self.max_skill_size,
                     });
                 }
                 if let PathType::InboxPassthrough {
@@ -150,6 +151,7 @@ impl SkillFs {
                         self.send_sync(SyncEvent::Reparse {
                             skill_name: skill_name.clone(),
                             source_path: self.inbox_skill_dir(skill_name).join("SKILL.md"),
+                            max_skill_size: self.max_skill_size,
                         });
                     }
                 }
@@ -529,6 +531,7 @@ impl SkillFs {
                     self.send_sync(SyncEvent::Reparse {
                         skill_name: skill_name.clone(),
                         source_path: physical.clone(),
+                        max_skill_size: self.max_skill_size,
                     });
                 }
                 if let PathType::InboxPassthrough {
@@ -540,6 +543,7 @@ impl SkillFs {
                         self.send_sync(SyncEvent::Reparse {
                             skill_name: skill_name.clone(),
                             source_path: physical.clone(),
+                            max_skill_size: self.max_skill_size,
                         });
                     }
                 }
@@ -1067,6 +1071,7 @@ impl SkillFs {
                         self.send_sync(SyncEvent::Reparse {
                             skill_name: skill_name.clone(),
                             source_path: physical.clone(),
+                            max_skill_size: self.max_skill_size,
                         });
                     }
                     // D1.3-demo: truncate is the only setattr

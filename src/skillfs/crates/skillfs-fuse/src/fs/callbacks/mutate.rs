@@ -1294,6 +1294,7 @@ impl SkillFs {
                             self.send_sync(SyncEvent::Reparse {
                                 skill_name: skill_name.clone(),
                                 source_path: new_physical.clone(),
+                                max_skill_size: self.max_skill_size,
                             });
                         }
                         if let PathType::SkillMd { skill_name } = &old_type {
