@@ -174,13 +174,17 @@ sudo ktuner rollback <param>  # 回滚单个已记录参数，例如 vm.dirty_by
 
 ### rollback --list 输出
 
-`sudo ktuner rollback --list` 预览回滚将恢复的内容——只读，不写入不删除（ledger 是 0700 root 目录下的 0600 文件，因此与 rollback 共用 root 门槛；损坏的 ledger 报错而不是当作空列表）：
+`sudo ktuner rollback --list` 预览回滚将恢复的内容——只读，不写入不删除（ledger 是 0700 root 目录下的 0600 文件，因此与 rollback 共用 root 门槛；损坏的 ledger 报错而不是当作空列表）。每个条目保留原有的 `param`/`applied`/`previous`，并新增内核当前的实际状态：`live` 从该条目自己的路径读取，使用与其他所有界面相同的读取器（sysfs 选项列表取方括号中的活动项、多值 sysctl 折叠为单空格）；`drifted` 表示 `live` 是否仍与 `applied` 一致，比较方式与写入校验相同——内核按自身形态呈现的值（方括号选项列表、TAB 分隔的多值、领先 token 回显）不算漂移：
 
 ```json
-{"count": 2, "pending": [{"applied": "1", "param": "vm.swappiness", "previous": "60"}]}
+{"count": 3, "pending": [
+  {"applied": "none", "drifted": null, "live": null, "param": "block/sda/scheduler", "previous": "mq-deadline"},
+  {"applied": "0", "drifted": true, "live": "20", "param": "vm.dirty_ratio", "previous": "20"},
+  {"applied": "1", "drifted": false, "live": "1", "param": "vm.swappiness", "previous": "60"}
+]}
 ```
 
-普通 `ktuner rollback` 行为不变：恢复、定稿 ledger 并清理。
+被内核作为互斥孪生副作用清零的条目记录 `applied = "0"`（内核实际写入的值），因此当它不再为 0 时即为漂移。路径无法读取（设备已消失、模块未加载、write-only 旋钮）时报 `live: null` 和 `drifted: null`：读不到值不算错误，漂移也不会改变退出码。列表是快照——预览与回滚之间内核可能变化。普通 `ktuner rollback` 行为不变：恢复、定稿 ledger 并清理。
 
 ### 错误输出（stderr）
 

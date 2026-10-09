@@ -196,13 +196,29 @@ JSON), never a silent success. `status` classifies this attempt
 
 `sudo ktuner rollback --list` previews what a rollback would restore — read-only, nothing is
 written or deleted (the ledger is 0600 under a 0700 root-owned dir, so it shares rollback's
-root gate; a corrupt ledger surfaces as an error rather than an empty list):
+root gate; a corrupt ledger surfaces as an error rather than an empty list). Each entry keeps
+its recorded `param`/`applied`/`previous` and adds what the kernel holds right now: `live`, read
+from the entry's own path through the same reader every other surface uses (the bracketed option
+of a sysfs list, the single-space form of a multi-value sysctl), and `drifted`, whether `live`
+still matches `applied` — compared the way a write is verified, so a value the kernel renders in
+its own shape (a bracketed option list, TAB-separated multi-value, a leading-token echo) is not
+drift:
 
 ```json
-{"count": 2, "pending": [{"applied": "1", "param": "vm.swappiness", "previous": "60"}]}
+{"count": 3, "pending": [
+  {"applied": "none", "drifted": null, "live": null, "param": "block/sda/scheduler", "previous": "mq-deadline"},
+  {"applied": "0", "drifted": true, "live": "20", "param": "vm.dirty_ratio", "previous": "20"},
+  {"applied": "1", "drifted": false, "live": "1", "param": "vm.swappiness", "previous": "60"}
+]}
 ```
 
-Plain `ktuner rollback` is unchanged: it restores, finalizes the ledger, and cleans up.
+An entry the kernel zeroed as a side effect of its mutually exclusive twin records
+`applied = "0"` — the value the kernel put live — so it is drifted once it is no longer 0. A path
+that cannot be read (a device that is gone, a module that is not loaded, a write-only tunable)
+reports `live: null` and `drifted: null`: an unreadable value is not an error and drift never
+changes the exit code. The listing is a snapshot — the kernel can change between the preview and
+the rollback. Plain `ktuner rollback` is unchanged: it restores, finalizes the ledger, and
+cleans up.
 
 ### error output (stderr)
 
