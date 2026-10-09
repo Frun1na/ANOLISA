@@ -1316,7 +1316,71 @@ fn systemctl_quiet(program: &str, args: &[&str]) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-pub fn rollback_preview() -> Result<Vec<(String, String, String)>> {
+/// One ledger row as `rollback --list` publishes it: the recorded
+/// (param, applied, previous) triple plus the value live in the kernel now.
+///
+/// `live` is read from the entry's own path — the file a restore writes —
+/// and rendered through [`active_value`], the reader every other surface
+/// uses; `drifted` compares it against `applied` with the same equality the
+/// write path uses (`live_reading` below). Both are `None` (JSON null) when
+/// the path cannot be read: a device that is gone, a module that is not
+/// loaded, a write-only tunable or unreadable content is reported as
+/// unreadable, never guessed — an absent reading is not an error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RollbackPreview {
+    pub param: String,
+    pub applied: String,
+    pub previous: String,
+    pub live: Option<String>,
+    pub drifted: Option<bool>,
+}
+
+/// The live value at `path` and whether it still matches `applied`, or
+/// `(None, None)` when the path cannot be read — a device that is gone, a
+/// module that is not loaded, a write-only tunable, unreadable content.
+///
+/// The value is rendered through [`active_value`], the single reader `why`,
+/// the ledger's original and the write read-back share, and `drifted` reuses
+/// [`classify_readback`], the equality the write path itself uses to decide
+/// whether a write took. Sharing both is what keeps a kernel-rendered value
+/// (a bracketed sysfs option, a TAB-separated multi-value sysctl, the
+/// leading-token echo of a scalar) from being reported as drift, and keeps
+/// the preview from inventing a second, stricter comparison of its own. The
+/// read is deliberately silent: an unreadable path is reported in the JSON,
+/// never printed and never an error.
+fn live_reading(path: &str, applied: &str) -> (Option<String>, Option<bool>) {
+    match fs::read_to_string(path) {
+        Ok(raw) => {
+            let drifted = matches!(
+                classify_readback(applied, raw.trim()),
+                ReadbackVerdict::Clamped { .. }
+            );
+            (Some(active_value(&raw)), Some(drifted))
+        }
+        Err(_) => (None, None),
+    }
+}
+
+/// Map a healed ledger to the rows `--list` publishes, in BTreeMap (param)
+/// order. Nothing is filtered or re-sorted: the published set must stay
+/// exactly the entry set a rollback would walk.
+fn preview_entries(data: &RollbackData) -> Vec<RollbackPreview> {
+    data.entries
+        .iter()
+        .map(|(param, entry)| {
+            let (live, drifted) = live_reading(&entry.path, &entry.applied);
+            RollbackPreview {
+                param: param.clone(),
+                applied: entry.applied.clone(),
+                previous: entry.previous.clone(),
+                live,
+                drifted,
+            }
+        })
+        .collect()
+}
+
+pub fn rollback_preview() -> Result<Vec<RollbackPreview>> {
     rollback_preview_at(ROLLBACK_PATH)
 }
 
@@ -1335,7 +1399,7 @@ pub fn rollback_preview() -> Result<Vec<(String, String, String)>> {
 /// `--list` exit 2. A shared lock is enough: preview never writes, and every
 /// writer/finalizer takes LOCK_EX on the same `<ledger>.lock`, so LOCK_SH
 /// keeps them out of the window without serializing parallel listings.
-fn rollback_preview_at(path: &str) -> Result<Vec<(String, String, String)>> {
+fn rollback_preview_at(path: &str) -> Result<Vec<RollbackPreview>> {
     // No ledger = nothing pending, which is not an error (a fresh install, or
     // a completed rollback): --list reports an empty pending set without
     // creating the ledger directory or lock file.
@@ -1352,11 +1416,11 @@ fn rollback_preview_at(path: &str) -> Result<Vec<(String, String, String)>> {
     #[cfg(test)]
     tests::finalize_race_probe(path);
     let json = fs::read_to_string(path).context("读取 rollback 文件失败")?;
-    parse_rollback_entries(&json)
+    Ok(preview_entries(&parse_rollback_ledger(&json)?))
 }
 
-/// Parse rollback-ledger JSON into (param, applied, previous) triples in
-/// BTreeMap order. A corrupt ledger is an error, never an empty list —
+/// Parse rollback-ledger JSON into the healed entry map the preview walks.
+/// A corrupt ledger is an error, never an empty list —
 /// silently treating a corrupt ledger as empty is how the original values
 /// get lost (cf. #3578).
 ///
@@ -1364,14 +1428,10 @@ fn rollback_preview_at(path: &str) -> Result<Vec<(String, String, String)>> {
 /// restore `rollback` will actually perform: `restore_entries` heals before
 /// restoring, and an unhealed preview would promise a second restore that
 /// never runs and report a `previous` the kernel will never receive.
-fn parse_rollback_entries(json: &str) -> Result<Vec<(String, String, String)>> {
+fn parse_rollback_ledger(json: &str) -> Result<RollbackData> {
     let mut data: RollbackData = serde_json::from_str(json).context("解析 rollback 文件失败")?;
     heal_alias_duplicates(&mut data);
-    Ok(data
-        .entries
-        .iter()
-        .map(|(param, entry)| (param.clone(), entry.applied.clone(), entry.previous.clone()))
-        .collect())
+    Ok(data)
 }
 
 /// Restore just the ledger entry a parameter names, leaving every other entry
@@ -2933,7 +2993,7 @@ mod tests {
             .collect(),
         };
         let json = serde_json::to_string(&data).unwrap();
-        let entries = parse_rollback_entries(&json).unwrap();
+        let entries = triples(&parse_rollback_ledger(&json).unwrap());
         assert_eq!(
             entries,
             vec![
@@ -2951,11 +3011,20 @@ mod tests {
         );
     }
 
+    /// (param, applied, previous) view of a parsed ledger, for the parse
+    /// tests whose subject is the healed entry set rather than the live read.
+    fn triples(data: &RollbackData) -> Vec<(String, String, String)> {
+        data.entries
+            .iter()
+            .map(|(param, entry)| (param.clone(), entry.applied.clone(), entry.previous.clone()))
+            .collect()
+    }
+
     #[test]
     fn test_parse_rollback_entries_empty_ledger() {
         // Fresh install / post-rollback state: empty, not an error.
-        let entries = parse_rollback_entries(r#"{"version":1,"entries":{}}"#).unwrap();
-        assert!(entries.is_empty());
+        let data = parse_rollback_ledger(r#"{"version":1,"entries":{}}"#).unwrap();
+        assert!(data.entries.is_empty());
     }
 
     #[test]
@@ -2965,13 +3034,15 @@ mod tests {
         // The preview must describe the healed restore — one pending entry
         // returning the pristine 60 — not promise a second restore (10) that
         // rollback never performs.
-        let entries = parse_rollback_entries(
-            r#"{"version":1,"entries":{
+        let entries = triples(
+            &parse_rollback_ledger(
+                r#"{"version":1,"entries":{
                 "vm.swappiness":{"previous":"60","applied":"10","path":"/proc/sys/vm/swappiness"},
                 "vm/swappiness":{"previous":"10","applied":"5","path":"/proc/sys/vm/swappiness"}
             }}"#,
-        )
-        .unwrap();
+            )
+            .unwrap(),
+        );
         assert_eq!(
             entries,
             vec![(
@@ -2988,13 +3059,15 @@ mod tests {
         // No chain relation: the survivor is the greatest key, exactly the
         // record restore_entries writes today, so preview and restore agree
         // on both the row count and the previous value that lands.
-        let entries = parse_rollback_entries(
-            r#"{"version":1,"entries":{
+        let entries = triples(
+            &parse_rollback_ledger(
+                r#"{"version":1,"entries":{
                 "vm.swappiness":{"previous":"60","applied":"10","path":"/proc/sys/vm/swappiness"},
                 "vm/swappiness":{"previous":"20","applied":"30","path":"/proc/sys/vm/swappiness"}
             }}"#,
-        )
-        .unwrap();
+            )
+            .unwrap(),
+        );
         assert_eq!(
             entries,
             vec![(
@@ -3009,7 +3082,10 @@ mod tests {
     #[test]
     fn test_parse_rollback_entries_rejects_corrupt_json() {
         // The #3578 "corrupt is not empty" contract.
-        let err = parse_rollback_entries("not json").unwrap_err();
+        let err = match parse_rollback_ledger("not json") {
+            Ok(_) => panic!("a corrupt ledger must not parse"),
+            Err(err) => err,
+        };
         assert!(err.to_string().contains("解析"), "got: {err}");
     }
 
@@ -3017,8 +3093,8 @@ mod tests {
     fn test_parse_rollback_entries_rejects_wrong_shape() {
         // Wrong top-level type and wrong entries type: Err, no panic, no
         // silent default.
-        assert!(parse_rollback_entries("[1,2,3]").is_err());
-        assert!(parse_rollback_entries(r#"{"entries":"x"}"#).is_err());
+        assert!(parse_rollback_ledger("[1,2,3]").is_err());
+        assert!(parse_rollback_ledger(r#"{"entries":"x"}"#).is_err());
     }
 
     #[test]
@@ -3042,8 +3118,13 @@ mod tests {
                 .collect(),
         };
         let json = serde_json::to_string(&data).unwrap();
-        let entries = parse_rollback_entries(&json).unwrap();
-        let params: Vec<&str> = entries.iter().map(|(p, _, _)| p.as_str()).collect();
+        let params: Vec<String> = parse_rollback_ledger(&json)
+            .unwrap()
+            .entries
+            .keys()
+            .cloned()
+            .collect();
+        let params: Vec<&str> = params.iter().map(String::as_str).collect();
         assert_eq!(params, vec!["a", "b", "c"]);
     }
 
@@ -4542,37 +4623,298 @@ mod tests {
         drop(file);
     }
 
+    /// Write a hand-built ledger whose entries point at caller-chosen paths,
+    /// so the live reads hit temp fixture files (a gone device and an
+    /// unreadable path included) instead of the host's /proc/sys and /sys.
+    fn write_preview_ledger(path: &str, entries: &[(&str, &str, &str, &str)]) {
+        let mut map = serde_json::Map::new();
+        for (param, previous, applied, target) in entries {
+            map.insert(
+                (*param).to_string(),
+                serde_json::json!({
+                    "previous": previous, "applied": applied, "path": target,
+                }),
+            );
+        }
+        fs::write(
+            path,
+            serde_json::json!({ "version": 1, "entries": map }).to_string(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn test_rollback_preview_reports_pending_set() {
-        // Control: a normal preview is unchanged by the locking — the pending
-        // triples come back in (param, applied, previous) shape, BTreeMap order.
+        // Control: a normal preview still publishes the recorded
+        // (param, applied, previous) triples exactly as before — same values,
+        // same BTreeMap order, nothing filtered — and adds the live reading
+        // on top. The fixture paths are temp files, so the live read never
+        // touches the host's /proc/sys or /sys.
         let dir = AtomicTestDir::new("preview-normal");
         let ledger = dir.0.join("rollback.json");
         let path = ledger.to_str().unwrap();
-        merge_rollback_at(
+        let somaxconn = dir.0.join("somaxconn");
+        let swappiness = dir.0.join("swappiness");
+        fs::write(&somaxconn, "256\n").unwrap();
+        fs::write(&swappiness, "10\n").unwrap();
+        write_preview_ledger(
             path,
-            [
-                ("vm.swappiness".into(), "60".into(), "10".into()),
-                ("net.core.somaxconn".into(), "128".into(), "256".into()),
+            &[
+                ("vm.swappiness", "60", "10", swappiness.to_str().unwrap()),
+                (
+                    "net.core.somaxconn",
+                    "128",
+                    "256",
+                    somaxconn.to_str().unwrap(),
+                ),
             ],
-        )
-        .unwrap();
+        );
         let entries = rollback_preview_at(path).unwrap();
         assert_eq!(
             entries,
             vec![
-                (
-                    "net.core.somaxconn".to_string(),
-                    "256".to_string(),
-                    "128".to_string()
-                ),
-                (
-                    "vm.swappiness".to_string(),
-                    "10".to_string(),
-                    "60".to_string()
-                ),
+                RollbackPreview {
+                    param: "net.core.somaxconn".to_string(),
+                    applied: "256".to_string(),
+                    previous: "128".to_string(),
+                    live: Some("256".to_string()),
+                    drifted: Some(false),
+                },
+                RollbackPreview {
+                    param: "vm.swappiness".to_string(),
+                    applied: "10".to_string(),
+                    previous: "60".to_string(),
+                    live: Some("10".to_string()),
+                    drifted: Some(false),
+                },
             ]
         );
+    }
+
+    #[test]
+    fn test_rollback_preview_flags_a_drifted_value() {
+        // The knob moved after ktuner wrote it: live must carry the value
+        // actually in the kernel, and drifted must say the recorded applied
+        // value is no longer the one live.
+        let dir = AtomicTestDir::new("preview-drift");
+        let ledger = dir.0.join("rollback.json");
+        let path = ledger.to_str().unwrap();
+        let target = dir.0.join("swappiness");
+        fs::write(&target, "60\n").unwrap();
+        write_preview_ledger(
+            path,
+            &[("vm.swappiness", "60", "1", target.to_str().unwrap())],
+        );
+        let entries = rollback_preview_at(path).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].live.as_deref(), Some("60"));
+        assert_eq!(entries[0].drifted, Some(true));
+    }
+
+    #[test]
+    fn test_rollback_preview_reports_nulls_for_a_missing_path() {
+        // The device is gone / the module is not loaded: the path cannot be
+        // read, which is not an error but an unanswerable comparison — both
+        // fields are null, and the row is still reported.
+        let dir = AtomicTestDir::new("preview-missing");
+        let ledger = dir.0.join("rollback.json");
+        let path = ledger.to_str().unwrap();
+        let target = dir.0.join("gone");
+        write_preview_ledger(
+            path,
+            &[(
+                "block/sda/scheduler",
+                "mq-deadline",
+                "none",
+                target.to_str().unwrap(),
+            )],
+        );
+        let entries = rollback_preview_at(path).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].live, None);
+        assert_eq!(entries[0].drifted, None);
+    }
+
+    #[test]
+    fn test_rollback_preview_reports_nulls_for_an_unreadable_path() {
+        // A path that exists but cannot be read as text (here: a directory)
+        // is unreadable, not empty and not an error: null, null.
+        let dir = AtomicTestDir::new("preview-unreadable");
+        let ledger = dir.0.join("rollback.json");
+        let path = ledger.to_str().unwrap();
+        let target = dir.0.join("a-directory");
+        fs::create_dir(&target).unwrap();
+        write_preview_ledger(
+            path,
+            &[("vm.swappiness", "60", "1", target.to_str().unwrap())],
+        );
+        let entries = rollback_preview_at(path).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].live, None);
+        assert_eq!(entries[0].drifted, None);
+    }
+
+    #[test]
+    fn test_rollback_preview_normalizes_multi_value_reads() {
+        // tcp_rmem-style: the kernel renders the value TAB-separated while
+        // the ledger records (and every other surface publishes) the
+        // single-space form. The live value must come back in that canonical
+        // form and the comparison must not report the format difference as
+        // drift.
+        let dir = AtomicTestDir::new("preview-multi-value");
+        let ledger = dir.0.join("rollback.json");
+        let path = ledger.to_str().unwrap();
+        let target = dir.0.join("tcp_rmem");
+        fs::write(&target, "4096\t87380\t6291456\n").unwrap();
+        write_preview_ledger(
+            path,
+            &[(
+                "net.ipv4.tcp_rmem",
+                "4096 87380 6291456",
+                "4096 87380 6291456",
+                target.to_str().unwrap(),
+            )],
+        );
+        let entries = rollback_preview_at(path).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].live.as_deref(), Some("4096 87380 6291456"));
+        assert_eq!(entries[0].drifted, Some(false));
+    }
+
+    #[test]
+    fn test_rollback_preview_reads_the_active_option() {
+        // sysfs option lists bracket the ACTIVE choice: the live value is
+        // that token, and it matches the ledger even though the file's own
+        // rendering differs.
+        let dir = AtomicTestDir::new("preview-option-list");
+        let ledger = dir.0.join("rollback.json");
+        let path = ledger.to_str().unwrap();
+        let target = dir.0.join("scheduler");
+        fs::write(&target, "[none] mq-deadline kyber\n").unwrap();
+        write_preview_ledger(
+            path,
+            &[(
+                "block/sda/scheduler",
+                "mq-deadline",
+                "none",
+                target.to_str().unwrap(),
+            )],
+        );
+        let entries = rollback_preview_at(path).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].live.as_deref(), Some("none"));
+        assert_eq!(entries[0].drifted, Some(false));
+    }
+
+    #[test]
+    fn test_rollback_preview_tolerates_a_leading_token_echo() {
+        // The write path confirms a scalar write when the read-back leads
+        // with the written token (the kernel may append its own rendering).
+        // Reusing that equality keeps the preview from calling the same file
+        // drift under a stricter comparison of its own.
+        let dir = AtomicTestDir::new("preview-leading-token");
+        let ledger = dir.0.join("rollback.json");
+        let path = ledger.to_str().unwrap();
+        let target = dir.0.join("congestion");
+        fs::write(&target, "bbr cubic\n").unwrap();
+        write_preview_ledger(
+            path,
+            &[(
+                "net.ipv4.tcp_congestion_control",
+                "cubic",
+                "bbr",
+                target.to_str().unwrap(),
+            )],
+        );
+        let entries = rollback_preview_at(path).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].live.as_deref(), Some("bbr cubic"));
+        assert_eq!(entries[0].drifted, Some(false));
+    }
+
+    #[test]
+    fn test_rollback_preview_compares_a_cleared_twin_against_the_kernel_zero() {
+        // The kernel zeroes a mutually exclusive twin on the clearer's write,
+        // and the ledger records applied = "0" for that twin. While it still
+        // reads 0 the pair state the write left is live; the moment it is
+        // non-zero (someone set the ratio again) the preview reports drift on
+        // that row like on any other.
+        let dir = AtomicTestDir::new("preview-cleared-twin");
+        let ledger = dir.0.join("rollback.json");
+        let path = ledger.to_str().unwrap();
+        let cleared = dir.0.join("dirty_background_ratio");
+        let reenabled = dir.0.join("dirty_ratio");
+        fs::write(&cleared, "0\n").unwrap();
+        fs::write(&reenabled, "20\n").unwrap();
+        write_preview_ledger(
+            path,
+            &[
+                (
+                    "vm.dirty_background_ratio",
+                    "10",
+                    "0",
+                    cleared.to_str().unwrap(),
+                ),
+                ("vm.dirty_ratio", "20", "0", reenabled.to_str().unwrap()),
+            ],
+        );
+        let entries = rollback_preview_at(path).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].param, "vm.dirty_background_ratio");
+        assert_eq!(entries[0].live.as_deref(), Some("0"));
+        assert_eq!(entries[0].drifted, Some(false));
+        assert_eq!(entries[1].param, "vm.dirty_ratio");
+        assert_eq!(entries[1].live.as_deref(), Some("20"));
+        assert_eq!(entries[1].drifted, Some(true));
+    }
+
+    #[test]
+    fn test_rollback_preview_drifted_is_null_exactly_when_live_is() {
+        // One invariant across every readability outcome: drifted is a
+        // comparison, so it exists exactly when there is a live value to
+        // compare. No row may claim "not drifted" from an unreadable path.
+        let dir = AtomicTestDir::new("preview-invariant");
+        let ledger = dir.0.join("rollback.json");
+        let path = ledger.to_str().unwrap();
+        let same = dir.0.join("same");
+        let moved = dir.0.join("moved");
+        let missing = dir.0.join("missing");
+        let unreadable = dir.0.join("unreadable");
+        fs::write(&same, "1").unwrap();
+        fs::write(&moved, "2").unwrap();
+        fs::create_dir(&unreadable).unwrap();
+        write_preview_ledger(
+            path,
+            &[
+                ("a.same", "0", "1", same.to_str().unwrap()),
+                ("b.moved", "0", "1", moved.to_str().unwrap()),
+                ("c.missing", "0", "1", missing.to_str().unwrap()),
+                ("d.unreadable", "0", "1", unreadable.to_str().unwrap()),
+            ],
+        );
+        let entries = rollback_preview_at(path).unwrap();
+        assert_eq!(entries.len(), 4);
+        let readings: Vec<(Option<&str>, Option<bool>)> = entries
+            .iter()
+            .map(|e| (e.live.as_deref(), e.drifted))
+            .collect();
+        assert_eq!(
+            readings,
+            vec![
+                (Some("1"), Some(false)),
+                (Some("2"), Some(true)),
+                (None, None),
+                (None, None),
+            ]
+        );
+        for entry in &entries {
+            assert_eq!(
+                entry.drifted.is_none(),
+                entry.live.is_none(),
+                "{}: drifted must be null exactly when live is",
+                entry.param
+            );
+        }
     }
 
     #[test]
@@ -4625,14 +4967,13 @@ mod tests {
         let entries = rollback_preview_at(path)
             .expect("preview must survive a concurrent finalize's delete window");
         ARM_FINALIZE_RACE_PROBE.store(false, Ordering::SeqCst);
-        assert_eq!(
-            entries,
-            vec![(
-                "vm.swappiness".to_string(),
-                "10".to_string(),
-                "60".to_string()
-            )]
-        );
+        // The recorded triple is the contract under test here; the live read
+        // is not asserted (merge_rollback_at points the entry at the host's
+        // /proc/sys path).
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].param, "vm.swappiness");
+        assert_eq!(entries[0].applied, "10");
+        assert_eq!(entries[0].previous, "60");
     }
 
     #[test]

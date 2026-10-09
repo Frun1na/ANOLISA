@@ -771,15 +771,22 @@ fn why_with(
 
 /// JSON shape of `ktuner rollback --list`. Pure so the agent-facing contract
 /// (key names, count, entry fields, ordering) is unit-testable without a
-/// ledger on disk. Entries arrive as `rollback_preview` returns them:
-/// (param, applied, previous), sorted by param (BTreeMap order).
-fn rollback_list_output(entries: &[(String, String, String)]) -> serde_json::Value {
+/// ledger on disk. Entries arrive as `rollback_preview` returns them, sorted
+/// by param (BTreeMap order); `live` and `drifted` arrive as `Option`s so an
+/// unreadable path publishes JSON `null` instead of a guessed value.
+fn rollback_list_output(entries: &[tuner::RollbackPreview]) -> serde_json::Value {
     json!({
         "count": entries.len(),
         "pending": entries
             .iter()
-            .map(|(param, applied, previous)| {
-                json!({ "param": param, "applied": applied, "previous": previous })
+            .map(|entry| {
+                json!({
+                    "param": entry.param,
+                    "applied": entry.applied,
+                    "previous": entry.previous,
+                    "live": entry.live,
+                    "drifted": entry.drifted,
+                })
             })
             .collect::<Vec<_>>(),
     })
@@ -1068,6 +1075,22 @@ mod tests {
         }
     }
 
+    fn preview_entry(
+        param: &str,
+        applied: &str,
+        previous: &str,
+        live: Option<&str>,
+        drifted: Option<bool>,
+    ) -> tuner::RollbackPreview {
+        tuner::RollbackPreview {
+            param: param.to_string(),
+            applied: applied.to_string(),
+            previous: previous.to_string(),
+            live: live.map(str::to_string),
+            drifted,
+        }
+    }
+
     #[test]
     fn rollback_list_output_empty() {
         // Empty ledger: count 0, empty pending — still a valid listing.
@@ -1080,19 +1103,50 @@ mod tests {
     #[test]
     fn rollback_list_output_maps_every_field() {
         let entries = vec![
-            (
-                "vm.swappiness".to_string(),
-                "1".to_string(),
-                "60".to_string(),
-            ),
-            (
-                "block/sda/scheduler".to_string(),
-                "none".to_string(),
-                "mq-deadline".to_string(),
-            ),
+            preview_entry("vm.swappiness", "1", "60", Some("1"), Some(false)),
+            preview_entry("block/sda/scheduler", "none", "mq-deadline", None, None),
         ];
         assert_eq!(
             rollback_list_output(&entries),
+            json!({
+                "count": 2,
+                "pending": [
+                    {
+                        "applied": "1",
+                        "drifted": false,
+                        "live": "1",
+                        "param": "vm.swappiness",
+                        "previous": "60",
+                    },
+                    {
+                        "applied": "none",
+                        "drifted": null,
+                        "live": null,
+                        "param": "block/sda/scheduler",
+                        "previous": "mq-deadline",
+                    },
+                ]
+            })
+        );
+    }
+
+    /// The regression this feature owes: the two new keys are the ONLY change
+    /// to the published shape. Stripping them from the output must reproduce,
+    /// field for field, what `rollback --list` emitted before they existed.
+    #[test]
+    fn rollback_list_output_adds_only_live_and_drifted() {
+        let entries = vec![
+            preview_entry("vm.swappiness", "1", "60", Some("60"), Some(true)),
+            preview_entry("block/sda/scheduler", "none", "mq-deadline", None, None),
+        ];
+        let mut out = rollback_list_output(&entries);
+        for entry in out["pending"].as_array_mut().unwrap() {
+            let object = entry.as_object_mut().unwrap();
+            object.remove("live");
+            object.remove("drifted");
+        }
+        assert_eq!(
+            out,
             json!({
                 "count": 2,
                 "pending": [
@@ -1104,12 +1158,43 @@ mod tests {
     }
 
     #[test]
+    fn rollback_list_output_keys_are_alphabetical() {
+        // The README's "Object keys are emitted in alphabetical order" is a
+        // hard contract for consumers: the serialized entry must carry
+        // applied < drifted < live < param < previous.
+        let entries = vec![preview_entry(
+            "vm.swappiness",
+            "1",
+            "60",
+            Some("1"),
+            Some(false),
+        )];
+        assert_eq!(
+            serde_json::to_string(&rollback_list_output(&entries)).unwrap(),
+            r#"{"count":1,"pending":[{"applied":"1","drifted":false,"live":"1","param":"vm.swappiness","previous":"60"}]}"#
+        );
+    }
+
+    #[test]
+    fn rollback_list_output_serializes_unknown_readings_as_null() {
+        // A path that could not be read has no value to publish and no
+        // comparison to report: the keys stay present with null and are never
+        // dropped, so a consumer never branches on key presence.
+        let entries = vec![preview_entry("vm.swappiness", "1", "60", None, None)];
+        let out = rollback_list_output(&entries);
+        let entry = &out["pending"][0];
+        assert!(entry.get("live").is_some_and(serde_json::Value::is_null));
+        assert!(entry.get("drifted").is_some_and(serde_json::Value::is_null));
+        assert_eq!(entry.as_object().unwrap().len(), 5, "entry keys: {entry}");
+    }
+
+    #[test]
     fn rollback_list_output_preserves_entry_order() {
         // The shaper must not re-sort: rollback_preview's BTreeMap order is
         // the contract.
         let entries = vec![
-            ("zzz".to_string(), "1".to_string(), "2".to_string()),
-            ("aaa".to_string(), "3".to_string(), "4".to_string()),
+            preview_entry("zzz", "1", "2", None, None),
+            preview_entry("aaa", "3", "4", None, None),
         ];
         let out = rollback_list_output(&entries);
         assert_eq!(out["pending"][0]["param"], json!("zzz"));
