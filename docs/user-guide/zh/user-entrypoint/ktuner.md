@@ -59,6 +59,7 @@ sudo ktuner tune --dry-run
 # 应用建议（需要 root）
 sudo ktuner tune               # 应用全部
 sudo ktuner tune --conservative
+sudo ktuner tune --exclude vm.dirty_ratio   # 应用其余全部、跳过这一项
 
 # 修复单个参数
 sudo ktuner fix vm.swappiness
@@ -75,6 +76,13 @@ sudo ktuner rollback --list   # 只读预览回滚将恢复的内容
 `1` check 发现可改进项或 rollback 仍有值未恢复、`2` 命令错误。
 回滚遇到写入失败或路径缺失时返回 `1`（包括部分恢复），仍在 stdout 输出 JSON 计数，
 并保留记录以便重试。空记录为成功的无操作（`0`）；记录缺失或无法读取为命令错误（`2`）。
+
+`tune --exclude <param>`（可重复）把点名的建议移出计划：不写入、不进回滚账本、
+不持久化。排除在 `--category` 与 `--conservative` 过滤之后生效；被排除项在输出中
+以 `would_skip`（原因 `excluded`）列出，未命中范围内任何建议的名字则出现在
+`unmatched_exclude` 中（计划为空时是全部给出的名字），而不是让命令失败。把全部建议
+排除是 `blocked` 运行、退出码 `1`，与任何无可应用项的计划一致。互斥 sysctl 对中写入另一半时，内核仍会把
+被排除的一半清零；ktuner 记录被清零的原值，`rollback` 可以恢复。
 
 ---
 
