@@ -1810,7 +1810,12 @@ fn eval_read_ahead_kb(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usiz
     let is_streaming = info.has_process("kafka")
         || info.has_process("flink")
         || info.has_process("spark")
-        || info.has_process("hadoop");
+        || info.has_process("hadoop")
+        // Pulsar is the same event-streaming class as Kafka, and it is in the
+        // classifier's streaming set (profile::classify), so a Pulsar host
+        // reports WorkloadType::IoThroughput. Keep the two gates on the same
+        // workload: the read-ahead rule is the one built for throughput hosts.
+        || info.has_process("pulsar");
 
     let is_db = info.has_process("postgres")
         || info.has_process("mysqld")
@@ -8572,6 +8577,51 @@ mod tests {
             "Should recommend read_ahead_kb for HDD with kafka"
         );
         assert_eq!(rec.unwrap().recommended_value, "2048");
+    }
+
+    #[test]
+    fn pulsar_counts_as_a_streaming_workload_for_read_ahead() {
+        // profile::classify puts a Pulsar broker in the same has_streaming set
+        // as Kafka, so such a host reports WorkloadType::IoThroughput; the
+        // read-ahead rule keeps its own copy of that set. Every case below
+        // uses the SAME disk data and only moves the process set, so the
+        // assertion follows the input rather than a literal.
+        let hdd = DiskInfo {
+            name: "sdb".to_string(),
+            disk_type: DiskType::HDD,
+            scheduler: "mq-deadline".to_string(),
+            available_schedulers: vec!["none".to_string(), "mq-deadline".to_string()],
+            nr_requests: 128,
+            read_ahead_kb: 128,
+            rq_affinity: 1,
+        };
+        let advice = |names: &[&str]| {
+            let mut info = make_test_info();
+            info.disks = vec![hdd.clone()];
+            info.processes = names
+                .iter()
+                .map(|n| ProcessInfo {
+                    name: n.to_string(),
+                })
+                .collect();
+            let recs = evaluate(&info).unwrap().recommendations;
+            recs.iter()
+                .find(|r| r.param == "block/sdb/read_ahead_kb")
+                .map(|r| r.recommended_value.clone())
+        };
+
+        // A Pulsar broker reads its log sequentially off the HDD.
+        assert_eq!(
+            advice(&["pulsar"]).as_deref(),
+            Some("2048"),
+            "a Pulsar broker is the streaming workload the classifier counts"
+        );
+        // Control: the gate itself is intact for the workloads already listed.
+        assert_eq!(advice(&["kafka"]).as_deref(), Some("2048"));
+        // A database running next to it does not cancel the sequential reads.
+        assert_eq!(advice(&["pulsar", "postgres"]).as_deref(), Some("2048"));
+        // And an unrelated workload still stays out.
+        assert_eq!(advice(&["nginx"]), None);
     }
 
     #[test]
