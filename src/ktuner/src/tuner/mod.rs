@@ -1880,6 +1880,7 @@ fn restore_units_with(
         restored: 0,
         failed: 0,
         skipped: 0,
+        boot_unit_enabled: true,
     };
     let mut retired = false;
     for unit in units {
@@ -1934,7 +1935,7 @@ fn restore_units_with(
     // A failed regenerate can leave the old boot config replaying the value
     // just restored. Keep its original in the ledger until every persisted
     // file is updated, so the same parameter can be retried after the failure.
-    persist_rollback_data_at(
+    outcome.boot_unit_enabled = persist_rollback_data_at(
         guard,
         data,
         sysctl_path,
@@ -2300,6 +2301,13 @@ pub struct RollbackOutcome {
     pub restored: usize,
     pub failed: usize,
     pub skipped: usize,
+    /// Whether the non-sysctl boot replay is still armed after this rollback.
+    /// A partial rollback regenerates the persisted files from the entries it
+    /// keeps and re-runs `systemctl enable`; `false` means that enable was
+    /// refused, so the block-device or THP values still recorded will not be
+    /// replayed after a reboot. `true` when nothing outside `/proc/sys` is
+    /// left to persist, and for every rollback that regenerates nothing.
+    pub boot_unit_enabled: bool,
 }
 
 impl RollbackOutcome {
@@ -2491,6 +2499,7 @@ fn restore_entries_with(
         restored,
         failed,
         skipped,
+        boot_unit_enabled: true,
     }
 }
 
@@ -2598,6 +2607,7 @@ fn rollback_inner(quiet: bool) -> Result<RollbackOutcome> {
         restored,
         mut failed,
         skipped,
+        ..
     } = restore_entries(&data, quiet);
 
     // A persisted file that survived cleanup re-applies the tuned values on the
@@ -2643,6 +2653,7 @@ fn rollback_inner(quiet: bool) -> Result<RollbackOutcome> {
         restored,
         failed,
         skipped,
+        boot_unit_enabled: true,
     })
 }
 
@@ -3767,6 +3778,56 @@ mod tests {
         assert!(service.exists(), "the unit itself is still written");
     }
 
+    /// A partial rollback regenerates the boot replay for the entries it keeps
+    /// and re-runs `systemctl enable`; a refused enable must reach the outcome
+    /// instead of being dropped, because the block/THP values still recorded
+    /// will not be replayed after a reboot.
+    #[test]
+    fn partial_rollback_reports_a_boot_unit_that_was_not_enabled() {
+        for (systemctl, armed) in [("true", true), ("false", false)] {
+            let dir = AtomicTestDir::new(&format!("rollback-boot-unit-{systemctl}"));
+            let (conf, service, script) = fixture_paths(&dir);
+            let swappiness = dir.0.join("swappiness");
+            let read_ahead = dir.0.join("read_ahead_kb");
+            fs::write(&swappiness, "10").unwrap();
+            fs::write(&read_ahead, "2048").unwrap();
+            let ledger = fixture_ledger(
+                &dir,
+                &[
+                    ("vm.swappiness", "60", "10", swappiness.to_str().unwrap()),
+                    (
+                        "block/sda/read_ahead_kb",
+                        "128",
+                        "2048",
+                        read_ahead.to_str().unwrap(),
+                    ),
+                ],
+            );
+            let guard = lock_ledger_at(&ledger).unwrap();
+            let mut data: RollbackData =
+                serde_json::from_str(&fs::read_to_string(&ledger).unwrap()).unwrap();
+            let keys = resolve_ledger_keys(&data.entries, &["vm.swappiness".to_string()]).unwrap();
+            let units = rollback_units(&data.entries, &keys);
+
+            let outcome = restore_units_with(
+                &guard, &mut data, &units, &ledger, &conf, &service, &script, systemctl,
+            )
+            .unwrap();
+
+            assert_eq!(outcome.restored, 1);
+            assert!(outcome.is_complete());
+            assert_eq!(fs::read_to_string(&swappiness).unwrap(), "60");
+            assert!(
+                Path::new(&service).exists(),
+                "the kept block entry regenerates its unit"
+            );
+            assert_eq!(
+                outcome.boot_unit_enabled, armed,
+                "systemctl {systemctl}: the boot replay verdict must reach the outcome"
+            );
+        }
+    }
+
     /// /etc/sysctl.d is owned by the package that replays it at boot, so its
     /// absence is the host telling us nothing would read the file.
     #[test]
@@ -4332,7 +4393,8 @@ mod tests {
             classify_rollback(&RollbackOutcome {
                 restored: 3,
                 failed: 0,
-                skipped: 0
+                skipped: 0,
+                boot_unit_enabled: true,
             }),
             RollbackStatus::Full
         );
@@ -4340,7 +4402,8 @@ mod tests {
             classify_rollback(&RollbackOutcome {
                 restored: 2,
                 failed: 1,
-                skipped: 0
+                skipped: 0,
+                boot_unit_enabled: true,
             }),
             RollbackStatus::Partial
         );
@@ -4351,7 +4414,8 @@ mod tests {
             classify_rollback(&RollbackOutcome {
                 restored: 2,
                 failed: 0,
-                skipped: 1
+                skipped: 1,
+                boot_unit_enabled: true,
             }),
             RollbackStatus::Partial
         );
@@ -4359,7 +4423,8 @@ mod tests {
             classify_rollback(&RollbackOutcome {
                 restored: 0,
                 failed: 2,
-                skipped: 0
+                skipped: 0,
+                boot_unit_enabled: true,
             }),
             RollbackStatus::Nothing
         );
@@ -4369,7 +4434,8 @@ mod tests {
             classify_rollback(&RollbackOutcome {
                 restored: 0,
                 failed: 0,
-                skipped: 0
+                skipped: 0,
+                boot_unit_enabled: true,
             }),
             RollbackStatus::Nothing
         );
@@ -4390,7 +4456,8 @@ mod tests {
                 RollbackOutcome {
                     restored,
                     failed,
-                    skipped
+                    skipped,
+                    boot_unit_enabled: true,
                 }
                 .is_complete(),
                 complete
@@ -4462,6 +4529,7 @@ mod tests {
             restored: 3,
             failed: cleanup_failed,
             skipped: 0,
+            boot_unit_enabled: true,
         };
         assert!(!outcome.is_complete());
         assert_eq!(classify_rollback(&outcome), RollbackStatus::Partial);
@@ -4622,6 +4690,7 @@ mod tests {
             restored: 3,
             failed: cleanup_failed,
             skipped: 0,
+            boot_unit_enabled: true,
         };
         assert!(!outcome.is_complete());
         assert_eq!(classify_rollback(&outcome), RollbackStatus::Partial);
