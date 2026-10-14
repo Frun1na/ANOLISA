@@ -1237,7 +1237,7 @@ fn rollback_list_output(entries: &[tuner::RollbackPreview]) -> serde_json::Value
 fn rollback_output(param: Option<&str>, outcome: &tuner::RollbackOutcome) -> serde_json::Value {
     let status = tuner::classify_rollback(outcome);
     let mut body = json!({
-        "restored": outcome.restored,
+        "restored": outcome.restored(),
         "failed": outcome.failed(),
         "skipped": outcome.skipped(),
         "status": format!("{status:?}"),
@@ -1654,6 +1654,13 @@ mod tests {
     }
 
     /// An outcome's missing list of length `n`, the path-absent entries.
+    /// An outcome's restored list of length `n`, the ledger keys a batch
+    /// landed. The body tests pin the keys and the names, so the fixture only
+    /// has to be well formed and carry the length under test.
+    fn test_restored(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("vm.ktuner_restored_{i}")).collect()
+    }
+
     fn test_missing(n: usize) -> Vec<String> {
         (0..n).map(|i| format!("vm.ktuner_missing_{i}")).collect()
     }
@@ -1671,7 +1678,7 @@ mod tests {
             ("mixed incomplete", 2, 1, 1, 1),
         ] {
             let outcome = tuner::RollbackOutcome {
-                restored,
+                restored_params: test_restored(restored),
                 failures: test_failures(failed),
                 missing: test_missing(skipped),
                 leftovers: Vec::new(),
@@ -4378,7 +4385,7 @@ mod tests {
         // the four keys it had, in the same byte layout (keys alphabetical,
         // two-space indent, no trailing newline here — the CLI adds one).
         let full = tuner::RollbackOutcome {
-            restored: 5,
+            restored_params: test_restored(5),
             failures: test_failures(0),
             missing: test_missing(0),
             leftovers: Vec::new(),
@@ -4401,7 +4408,7 @@ mod tests {
             (0, 0, 1, "Nothing"),
         ] {
             let outcome = tuner::RollbackOutcome {
-                restored,
+                restored_params: test_restored(restored),
                 failures: test_failures(failed),
                 missing: test_missing(skipped),
                 leftovers: Vec::new(),
@@ -4437,7 +4444,7 @@ mod tests {
     #[test]
     fn rollback_output_names_the_entries_a_rollback_left() {
         let outcome = tuner::RollbackOutcome {
-            restored: 1,
+            restored_params: test_restored(1),
             failures: test_failures(2),
             missing: test_missing(1),
             leftovers: Vec::new(),
@@ -4457,7 +4464,7 @@ mod tests {
     #[test]
     fn rollback_body_names_the_entries_in_every_shape() {
         let outcome = tuner::RollbackOutcome {
-            restored: 0,
+            restored_params: test_restored(0),
             failures: test_failures(1),
             missing: test_missing(1),
             leftovers: Vec::new(),
@@ -4501,7 +4508,7 @@ mod tests {
     #[test]
     fn rollback_output_hides_the_reports_when_nothing_was_left() {
         let clean = tuner::RollbackOutcome {
-            restored: 3,
+            restored_params: test_restored(3),
             failures: test_failures(0),
             missing: test_missing(0),
             leftovers: Vec::new(),
@@ -4522,7 +4529,7 @@ mod tests {
         // keeps; a refused enable must reach the body under the key `tune` and
         // `fix` publish, and an armed replay keeps the body unchanged.
         let unarmed = tuner::RollbackOutcome {
-            restored: 1,
+            restored_params: test_restored(1),
             failures: test_failures(0),
             missing: test_missing(0),
             leftovers: Vec::new(),
@@ -4553,7 +4560,7 @@ mod tests {
         // A recorded mutually exclusive twin is restored and counted too, so
         // `restored` may be 2 while `param` names the entry the caller chose.
         let twins = tuner::RollbackOutcome {
-            restored: 2,
+            restored_params: test_restored(2),
             failures: test_failures(0),
             missing: test_missing(0),
             leftovers: Vec::new(),
@@ -4569,7 +4576,7 @@ mod tests {
             "{\n  \"failed\": 0,\n  \"param\": \"vm.dirty_bytes\",\n  \"restored\": 2,\n  \"skipped\": 0,\n  \"status\": \"Full\"\n}"
         );
         let skipped = tuner::RollbackOutcome {
-            restored: 0,
+            restored_params: test_restored(0),
             failures: test_failures(0),
             missing: test_missing(1),
             leftovers: Vec::new(),
@@ -4616,7 +4623,7 @@ mod tests {
         // introduced, byte for byte: the same four keys plus `param` naming
         // the ledger entry that was addressed.
         let twins = tuner::RollbackOutcome {
-            restored: 2,
+            restored_params: test_restored(2),
             failures: test_failures(0),
             missing: test_missing(0),
             leftovers: Vec::new(),
@@ -4632,7 +4639,7 @@ mod tests {
             "{\n  \"failed\": 0,\n  \"param\": \"vm.dirty_bytes\",\n  \"restored\": 2,\n  \"skipped\": 0,\n  \"status\": \"Full\"\n}"
         );
         let skipped = tuner::RollbackOutcome {
-            restored: 0,
+            restored_params: test_restored(0),
             failures: test_failures(0),
             missing: test_missing(1),
             leftovers: Vec::new(),
@@ -4652,7 +4659,7 @@ mod tests {
         // same four keys whatever it asked for. The array is the ledger key
         // of each positional, in the order given.
         let outcome = tuner::RollbackOutcome {
-            restored: 3,
+            restored_params: test_restored(3),
             failures: test_failures(0),
             missing: test_missing(0),
             leftovers: Vec::new(),
@@ -4679,7 +4686,7 @@ mod tests {
         // Only the shape changes: a partial batch reports the same status
         // vocabulary and counts as the single-parameter form.
         let partial = tuner::RollbackOutcome {
-            restored: 1,
+            restored_params: test_restored(1),
             failures: test_failures(1),
             missing: test_missing(1),
             leftovers: Vec::new(),
@@ -4730,7 +4737,7 @@ mod tests {
         // for a batch must be able to read the batch shape. `param` stays
         // reserved for the single-positional body, byte for byte.
         let outcome = tuner::RollbackOutcome {
-            restored: 1,
+            restored_params: test_restored(1),
             failures: test_failures(0),
             missing: test_missing(0),
             leftovers: Vec::new(),
@@ -4768,7 +4775,7 @@ mod tests {
         // No positional keeps the four-key body of a full rollback and gains
         // no `param`/`params` key: the batch shape must not leak into it.
         let full = tuner::RollbackOutcome {
-            restored: 5,
+            restored_params: test_restored(5),
             failures: test_failures(0),
             missing: test_missing(0),
             leftovers: Vec::new(),
