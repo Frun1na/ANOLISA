@@ -79,7 +79,7 @@ pub struct SysomMessage {
     pub role: String,
 
     /// Text content
-    #[serde(default)]
+    #[serde(default, deserialize_with = "content_as_text")]
     pub content: String,
 
     /// Tool call ID (for role=tool messages)
@@ -435,6 +435,31 @@ mod tests {
         assert_eq!(req.params.model, "qwen3-coder-plus");
         assert_eq!(req.params.messages.len(), 2);
         assert!(req.params.stream);
+    }
+
+    /// The request side of the same envelope: a multimodal user turn's
+    /// `llmParamString` message carries `content` as a parts array, and the
+    /// typed `SysomMessage` read it as a `String`. The array failed the whole
+    /// `llmParamString` decode, so the request recorded no prompt at all while
+    /// the other request readers join the block texts.
+    #[test]
+    fn test_parse_request_block_array_content() {
+        let params = serde_json::json!({
+            "model": "qwen3-coder-plus",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is in this image?"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}}
+                ]
+            }],
+            "stream": false,
+            "use_dashscope": true
+        });
+        let body = serde_json::json!({"llmParamString": params.to_string()});
+
+        let req = SysomParser::parse_request(&body).expect("a parts-array message must parse");
+        assert_eq!(req.params.messages[0].content, "what is in this image?");
     }
 
     #[test]
